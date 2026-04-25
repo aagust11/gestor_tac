@@ -1,0 +1,5 @@
+{
+  "dataPath": "./data.json",
+  "assignacionsXlsxPath": "./data/assignacions.xlsx",
+  "estatsXlsxPath": "./data/estats.xlsx"
+}
