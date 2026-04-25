@@ -1,8 +1,14 @@
 import cors from 'cors';
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
+import xlsx from 'xlsx';
 
-import { ESTATS_ASSIGNACIO, ESTATS_INCIDENCIA } from './constants/domainConstants.js';
+import {
+  ESTATS_ASSIGNACIO,
+  ESTATS_DISPOSITIU,
+  ESTATS_INCIDENCIA,
+  TIPUS_DISPOSITIU
+} from './constants/domainConstants.js';
 import { loadAndValidateConfig, testWriteAccess } from './services/configService.js';
 import { ensureDataFile, readData, updateData } from './services/storage.js';
 import { validateAssignment } from './validators/assignmentValidator.js';
@@ -22,6 +28,8 @@ app.use(
 app.use(express.json());
 
 const api = express.Router();
+const SHEET_REGISTRE = 'Registre';
+let runtimeConfigPromise = null;
 
 function nowIso() {
   return new Date().toISOString();
@@ -52,6 +60,92 @@ function sendNotFound(res, resourceName) {
   });
 }
 
+function normalizeComparable(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function valueMatches(haystack, needle) {
+  const normalizedNeedle = normalizeComparable(needle);
+  if (!normalizedNeedle) {
+    return true;
+  }
+
+  return normalizeComparable(haystack).includes(normalizedNeedle);
+}
+
+function findPersonBySearch(people, search = {}) {
+  const { id, identificador, nom, correu } = search;
+
+  if (id) {
+    return people.find((person) => person.id === id) ?? null;
+  }
+
+  const candidates = people.filter((person) => (
+    valueMatches(person.identificador, identificador)
+    && valueMatches(person.nom, nom)
+    && valueMatches(person.correu, correu)
+  ));
+
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+function findDeviceBySearch(devices, search = {}) {
+  const { id, sace, sn } = search;
+
+  if (id) {
+    return devices.find((device) => device.id === id) ?? null;
+  }
+
+  const candidates = devices.filter((device) => (
+    valueMatches(device.sace, sace)
+    && valueMatches(device.sn, sn)
+  ));
+
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+function getWorksheet(workbook, preferredName) {
+  if (workbook.Sheets[preferredName]) {
+    return workbook.Sheets[preferredName];
+  }
+
+  if (workbook.SheetNames.length === 0) {
+    const worksheet = xlsx.utils.aoa_to_sheet([]);
+    xlsx.utils.book_append_sheet(workbook, worksheet, preferredName);
+    return worksheet;
+  }
+
+  return workbook.Sheets[workbook.SheetNames[0]];
+}
+
+async function getRuntimeConfig() {
+  runtimeConfigPromise ??= loadAndValidateConfig();
+  return runtimeConfigPromise;
+}
+
+function appendRowToWorkbook(filePath, sheetName, row) {
+  const workbook = xlsx.readFile(filePath);
+  const worksheet = getWorksheet(workbook, sheetName);
+  xlsx.utils.sheet_add_aoa(worksheet, [row], { origin: -1 });
+  xlsx.writeFile(workbook, filePath);
+}
+
+function appendAssignmentRowsToExcel(config, person, device) {
+  appendRowToWorkbook(
+    config.assignacionsXlsxPath,
+    SHEET_REGISTRE,
+    [person.identificador ?? '', '', device.sace ?? '']
+  );
+
+  if ([TIPUS_DISPOSITIU.ORDINADOR_ALUMNE, TIPUS_DISPOSITIU.ORDINADOR_DOCENT].includes(device.tipus)) {
+    appendRowToWorkbook(
+      config.estatsXlsxPath,
+      SHEET_REGISTRE,
+      ['', device.sace ?? '', ESTATS_DISPOSITIU.ENTREGAT]
+    );
+  }
+}
+
 function handleValidationResult(errors) {
   if (errors.length > 0) {
     throw buildValidationError(errors);
@@ -78,6 +172,23 @@ api.get('/devices', async (_req, res, next) => {
   try {
     const data = await readData();
     res.json(data.devices);
+  } catch (error) {
+    next(error);
+  }
+});
+
+api.get('/devices/search', async (req, res, next) => {
+  try {
+    const data = await readData();
+    const { q, sace, sn } = req.query;
+    const queryText = typeof q === 'string' ? q : '';
+
+    const devices = data.devices.filter((device) => (
+      valueMatches(device.sace, sace ?? queryText)
+      || valueMatches(device.sn, sn ?? queryText)
+    ));
+
+    res.json(devices);
   } catch (error) {
     next(error);
   }
@@ -172,6 +283,24 @@ api.get('/people', async (_req, res, next) => {
   try {
     const data = await readData();
     res.json(data.people);
+  } catch (error) {
+    next(error);
+  }
+});
+
+api.get('/people/search', async (req, res, next) => {
+  try {
+    const data = await readData();
+    const { q, nom, correu, identificador } = req.query;
+    const queryText = typeof q === 'string' ? q : '';
+
+    const people = data.people.filter((person) => (
+      valueMatches(person.nom, nom ?? queryText)
+      || valueMatches(person.correu, correu ?? queryText)
+      || valueMatches(person.identificador, identificador ?? queryText)
+    ));
+
+    res.json(people);
   } catch (error) {
     next(error);
   }
@@ -288,19 +417,93 @@ api.get('/assignments/:id', async (req, res, next) => {
 
 api.post('/assignments', async (req, res, next) => {
   try {
-    const created = await updateData(async (currentData) => {
-      const nextPayload = {
-        estat: ESTATS_ASSIGNACIO.ACTIVA,
-        ...req.body
-      };
-      const errors = validateAssignment(nextPayload, currentData);
-      handleValidationResult(errors);
+    let summary = null;
 
-      const payload = withTimestampsOnCreate({ ...nextPayload, id: uuidv4() });
-      return { ...currentData, assignments: [...currentData.assignments, payload] };
+    await updateData(async (currentData) => {
+      const config = await getRuntimeConfig();
+      const person = findPersonBySearch(currentData.people, req.body.personSearch ?? { id: req.body.personId });
+      if (!person) {
+        const error = new Error('Persona no trobada amb els criteris de cerca.');
+        error.status = 404;
+        throw error;
+      }
+
+      const device = findDeviceBySearch(currentData.devices, req.body.deviceSearch ?? { id: req.body.deviceId });
+      if (!device) {
+        const error = new Error('Dispositiu no trobat amb els criteris de cerca.');
+        error.status = 404;
+        throw error;
+      }
+
+      const shouldClosePrevious = Boolean(req.body.returnPreviousAssignments ?? req.body.retorns);
+      const timestamp = nowIso();
+      const nextAssignments = [...currentData.assignments];
+      const nextDevices = [...currentData.devices];
+      const closedAssignments = [];
+
+      if (shouldClosePrevious) {
+        for (let index = 0; index < nextAssignments.length; index += 1) {
+          const assignment = nextAssignments[index];
+          if (assignment.personId === person.id && assignment.estat === ESTATS_ASSIGNACIO.ACTIVA) {
+            nextAssignments[index] = withTimestampsOnUpdate(assignment, {
+              estat: ESTATS_ASSIGNACIO.FINALITZADA,
+              endedAt: timestamp
+            });
+            closedAssignments.push(nextAssignments[index]);
+
+            const oldDeviceIndex = nextDevices.findIndex((candidate) => candidate.id === assignment.deviceId);
+            if (oldDeviceIndex !== -1) {
+              const oldDevice = nextDevices[oldDeviceIndex];
+              if (oldDevice.estat === ESTATS_DISPOSITIU.ENTREGAT) {
+                nextDevices[oldDeviceIndex] = withTimestampsOnUpdate(oldDevice, {
+                  estat: ESTATS_DISPOSITIU.DISPONIBLE
+                });
+              }
+            }
+          }
+        }
+      }
+
+      const newAssignment = withTimestampsOnCreate({
+        id: uuidv4(),
+        personId: person.id,
+        deviceId: device.id,
+        estat: ESTATS_ASSIGNACIO.ACTIVA,
+        startedAt: timestamp
+      });
+
+      const validationErrors = validateAssignment(newAssignment, {
+        ...currentData,
+        assignments: nextAssignments
+      });
+      handleValidationResult(validationErrors);
+
+      const targetDeviceIndex = nextDevices.findIndex((candidate) => candidate.id === device.id);
+      if (targetDeviceIndex === -1) {
+        const error = new Error('Dispositiu no trobat per actualitzar estat.');
+        error.status = 404;
+        throw error;
+      }
+
+      nextDevices[targetDeviceIndex] = withTimestampsOnUpdate(nextDevices[targetDeviceIndex], {
+        estat: ESTATS_DISPOSITIU.ENTREGAT
+      });
+
+      appendAssignmentRowsToExcel(config, person, device);
+
+      summary = {
+        closedAssignments,
+        newAssignment
+      };
+
+      return {
+        ...currentData,
+        assignments: [...nextAssignments, newAssignment],
+        devices: nextDevices
+      };
     });
 
-    res.status(201).json(created.assignments.at(-1));
+    res.status(201).json({ ok: true, ...summary });
   } catch (error) {
     next(error);
   }
