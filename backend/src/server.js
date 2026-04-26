@@ -1,7 +1,6 @@
 import cors from 'cors';
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import xlsx from 'xlsx';
 
 import {
   ESTATS_ASSIGNACIO,
@@ -10,6 +9,7 @@ import {
   TIPUS_DISPOSITIU
 } from './constants/domainConstants.js';
 import { loadAndValidateConfig, testWriteAccess } from './services/configService.js';
+import { appendAssignacio, appendEstat } from './services/xlsxService.js';
 import { ensureDataFile, readData, updateData } from './services/storage.js';
 import { validateAssignment } from './validators/assignmentValidator.js';
 import { buildValidationError } from './validators/commonValidator.js';
@@ -28,7 +28,6 @@ app.use(
 app.use(express.json());
 
 const api = express.Router();
-const SHEET_REGISTRE = 'Registre';
 let runtimeConfigPromise = null;
 
 function nowIso() {
@@ -104,45 +103,16 @@ function findDeviceBySearch(devices, search = {}) {
   return candidates.length === 1 ? candidates[0] : null;
 }
 
-function getWorksheet(workbook, preferredName) {
-  if (workbook.Sheets[preferredName]) {
-    return workbook.Sheets[preferredName];
-  }
-
-  if (workbook.SheetNames.length === 0) {
-    const worksheet = xlsx.utils.aoa_to_sheet([]);
-    xlsx.utils.book_append_sheet(workbook, worksheet, preferredName);
-    return worksheet;
-  }
-
-  return workbook.Sheets[workbook.SheetNames[0]];
-}
-
 async function getRuntimeConfig() {
   runtimeConfigPromise ??= loadAndValidateConfig();
   return runtimeConfigPromise;
 }
 
-function appendRowToWorkbook(filePath, sheetName, row) {
-  const workbook = xlsx.readFile(filePath);
-  const worksheet = getWorksheet(workbook, sheetName);
-  xlsx.utils.sheet_add_aoa(worksheet, [row], { origin: -1 });
-  xlsx.writeFile(workbook, filePath);
-}
-
-function appendAssignmentRowsToExcel(config, person, device) {
-  appendRowToWorkbook(
-    config.assignacionsXlsxPath,
-    SHEET_REGISTRE,
-    [person.identificador ?? '', '', device.sace ?? '']
-  );
+async function appendAssignmentRowsToExcel(config, person, device) {
+  await appendAssignacio(config.assignacionsXlsxPath, person.identificador ?? '', device.sace ?? '');
 
   if ([TIPUS_DISPOSITIU.ORDINADOR_ALUMNE, TIPUS_DISPOSITIU.ORDINADOR_DOCENT].includes(device.tipus)) {
-    appendRowToWorkbook(
-      config.estatsXlsxPath,
-      SHEET_REGISTRE,
-      ['', device.sace ?? '', ESTATS_DISPOSITIU.ENTREGAT]
-    );
+    await appendEstat(config.estatsXlsxPath, device.sace ?? '', ESTATS_DISPOSITIU.ENTREGAT);
   }
 }
 
@@ -489,7 +459,7 @@ api.post('/assignments', async (req, res, next) => {
         estat: ESTATS_DISPOSITIU.ENTREGAT
       });
 
-      appendAssignmentRowsToExcel(config, person, device);
+      await appendAssignmentRowsToExcel(config, person, device);
 
       summary = {
         closedAssignments,
