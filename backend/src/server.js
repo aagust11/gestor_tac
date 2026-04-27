@@ -108,11 +108,18 @@ function findDeviceBySearch(devices, search = {}) {
   return candidates.length === 1 ? candidates[0] : null;
 }
 
+function mapAssignmentDetail(assignment, people, devices) {
+  return {
+    ...assignment,
+    person: people.find((item) => item.id === assignment.personId) ?? null,
+    device: devices.find((item) => item.id === assignment.deviceId) ?? null
+  };
+}
+
 async function getRuntimeConfig() {
   runtimeConfigPromise ??= loadAndValidateConfig();
   return runtimeConfigPromise;
 }
-
 
 async function getDataPathFromConfig() {
   const config = await getRuntimeConfig();
@@ -146,7 +153,6 @@ function handleValidationResult(errors) {
 api.get('/health', (_req, res) => {
   res.json({ ok: true, servei: 'backend', basePath: '/api' });
 });
-
 
 api.get('/config', async (_req, res, next) => {
   try {
@@ -192,12 +198,13 @@ api.get('/devices', async (_req, res, next) => {
 api.get('/devices/search', async (req, res, next) => {
   try {
     const data = await readRuntimeData();
-    const { q, sace, sn } = req.query;
+    const { q, sace, sn, tipus } = req.query;
     const queryText = typeof q === 'string' ? q : '';
 
     const devices = data.devices.filter((device) => (
       valueMatches(device.sace, sace ?? queryText)
       || valueMatches(device.sn, sn ?? queryText)
+      || valueMatches(device.tipus, tipus ?? queryText)
     ));
 
     res.json(devices);
@@ -216,6 +223,27 @@ api.get('/devices/:id', async (req, res, next) => {
     }
 
     return res.json(device);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+api.get('/devices/:id/history', async (req, res, next) => {
+  try {
+    const data = await readRuntimeData();
+    const device = data.devices.find((item) => item.id === req.params.id);
+
+    if (!device) {
+      return sendNotFound(res, 'Dispositiu');
+    }
+
+    const assignments = data.assignments
+      .filter((item) => item.deviceId === req.params.id)
+      .map((item) => mapAssignmentDetail(item, data.people, data.devices));
+
+    const incidents = data.incidents.filter((item) => item.deviceId === req.params.id);
+
+    return res.json({ device, assignments, incidents });
   } catch (error) {
     return next(error);
   }
@@ -242,6 +270,7 @@ api.put('/devices/:id', async (req, res, next) => {
     let updatedDevice = null;
 
     await updateRuntimeData(async (currentData) => {
+      const config = await getRuntimeConfig();
       const index = currentData.devices.findIndex((item) => item.id === req.params.id);
       if (index === -1) {
         const error = new Error('Dispositiu no trobat/da.');
@@ -253,8 +282,13 @@ api.put('/devices/:id', async (req, res, next) => {
       handleValidationResult(errors);
 
       const nextDevices = [...currentData.devices];
-      updatedDevice = withTimestampsOnUpdate(nextDevices[index], req.body);
+      const previous = nextDevices[index];
+      updatedDevice = withTimestampsOnUpdate(previous, req.body);
       nextDevices[index] = updatedDevice;
+
+      if (previous.estat !== updatedDevice.estat) {
+        await appendEstat(config.estatsXlsxPath, updatedDevice.sace ?? '', updatedDevice.estat ?? '');
+      }
 
       return { ...currentData, devices: nextDevices };
     });
@@ -327,7 +361,11 @@ api.get('/people/:id', async (req, res, next) => {
       return sendNotFound(res, 'Persona');
     }
 
-    return res.json(person);
+    const activeAssignments = data.assignments
+      .filter((item) => item.personId === person.id && item.estat === ESTATS_ASSIGNACIO.ACTIVA)
+      .map((item) => mapAssignmentDetail(item, data.people, data.devices));
+
+    return res.json({ ...person, activeAssignments });
   } catch (error) {
     return next(error);
   }
@@ -406,9 +444,27 @@ api.delete('/people/:id', async (req, res, next) => {
 api.get('/assignments', async (_req, res, next) => {
   try {
     const data = await readRuntimeData();
-    res.json(data.assignments);
+    res.json(data.assignments.map((item) => mapAssignmentDetail(item, data.people, data.devices)));
   } catch (error) {
     next(error);
+  }
+});
+
+api.post('/assignments/preview', async (req, res, next) => {
+  try {
+    const data = await readRuntimeData();
+    const person = findPersonBySearch(data.people, req.body.personSearch ?? { id: req.body.personId });
+    if (!person) {
+      return res.json({ ok: false, person: null, activeAssignments: [] });
+    }
+
+    const activeAssignments = data.assignments
+      .filter((item) => item.personId === person.id && item.estat === ESTATS_ASSIGNACIO.ACTIVA)
+      .map((item) => mapAssignmentDetail(item, data.people, data.devices));
+
+    return res.json({ ok: true, person, activeAssignments });
+  } catch (error) {
+    return next(error);
   }
 });
 
@@ -421,7 +477,7 @@ api.get('/assignments/:id', async (req, res, next) => {
       return sendNotFound(res, 'Assignació');
     }
 
-    return res.json(assignment);
+    return res.json(mapAssignmentDetail(assignment, data.people, data.devices));
   } catch (error) {
     return next(error);
   }
@@ -447,31 +503,49 @@ api.post('/assignments', async (req, res, next) => {
         throw error;
       }
 
-      const shouldClosePrevious = Boolean(req.body.returnPreviousAssignments ?? req.body.retorns);
-      const timestamp = nowIso();
       const nextAssignments = [...currentData.assignments];
       const nextDevices = [...currentData.devices];
+      const timestamp = nowIso();
+
+      const activeForPerson = nextAssignments.filter((item) => (
+        item.personId === person.id && item.estat === ESTATS_ASSIGNACIO.ACTIVA
+      ));
+
+      const shouldCloseAllPrevious = Boolean(req.body.returnPreviousAssignments);
+      const selectedToReturn = Array.isArray(req.body.returnAssignmentIds)
+        ? req.body.returnAssignmentIds
+        : [];
+
+      const toReturnIds = shouldCloseAllPrevious
+        ? new Set(activeForPerson.map((item) => item.id))
+        : new Set(selectedToReturn);
+
       const closedAssignments = [];
 
-      if (shouldClosePrevious) {
-        for (let index = 0; index < nextAssignments.length; index += 1) {
-          const assignment = nextAssignments[index];
-          if (assignment.personId === person.id && assignment.estat === ESTATS_ASSIGNACIO.ACTIVA) {
-            nextAssignments[index] = withTimestampsOnUpdate(assignment, {
-              estat: ESTATS_ASSIGNACIO.FINALITZADA,
-              endedAt: timestamp
-            });
-            closedAssignments.push(nextAssignments[index]);
+      for (let index = 0; index < nextAssignments.length; index += 1) {
+        const assignment = nextAssignments[index];
+        if (assignment.personId !== person.id || assignment.estat !== ESTATS_ASSIGNACIO.ACTIVA) {
+          continue;
+        }
 
-            const oldDeviceIndex = nextDevices.findIndex((candidate) => candidate.id === assignment.deviceId);
-            if (oldDeviceIndex !== -1) {
-              const oldDevice = nextDevices[oldDeviceIndex];
-              if (oldDevice.estat === ESTATS_DISPOSITIU.ENTREGAT) {
-                nextDevices[oldDeviceIndex] = withTimestampsOnUpdate(oldDevice, {
-                  estat: ESTATS_DISPOSITIU.DISPONIBLE
-                });
-              }
-            }
+        if (!toReturnIds.has(assignment.id)) {
+          continue;
+        }
+
+        nextAssignments[index] = withTimestampsOnUpdate(assignment, {
+          estat: ESTATS_ASSIGNACIO.FINALITZADA,
+          endedAt: timestamp
+        });
+        closedAssignments.push(nextAssignments[index]);
+
+        const oldDeviceIndex = nextDevices.findIndex((candidate) => candidate.id === assignment.deviceId);
+        if (oldDeviceIndex !== -1) {
+          const oldDevice = nextDevices[oldDeviceIndex];
+          if (oldDevice.estat === ESTATS_DISPOSITIU.ENTREGAT) {
+            nextDevices[oldDeviceIndex] = withTimestampsOnUpdate(oldDevice, {
+              estat: ESTATS_DISPOSITIU.DISPONIBLE
+            });
+            await appendEstat(config.estatsXlsxPath, oldDevice.sace ?? '', ESTATS_DISPOSITIU.DISPONIBLE);
           }
         }
       }
@@ -481,7 +555,8 @@ api.post('/assignments', async (req, res, next) => {
         personId: person.id,
         deviceId: device.id,
         estat: ESTATS_ASSIGNACIO.ACTIVA,
-        startedAt: timestamp
+        startedAt: timestamp,
+        endedAt: null
       });
 
       const validationErrors = validateAssignment(newAssignment, {
@@ -501,11 +576,13 @@ api.post('/assignments', async (req, res, next) => {
         estat: ESTATS_DISPOSITIU.ENTREGAT
       });
 
-      await appendAssignmentRowsToExcel(config, person, device);
+      await appendAssignmentRowsToExcel(config, person, nextDevices[targetDeviceIndex]);
 
       summary = {
         closedAssignments,
-        newAssignment
+        newAssignment,
+        person,
+        activeAssignmentsBefore: activeForPerson.map((item) => mapAssignmentDetail(item, currentData.people, currentData.devices))
       };
 
       return {
@@ -583,7 +660,10 @@ api.delete('/assignments/:id', async (req, res, next) => {
 api.get('/incidents', async (_req, res, next) => {
   try {
     const data = await readRuntimeData();
-    res.json(data.incidents);
+    res.json(data.incidents.map((item) => ({
+      ...item,
+      device: data.devices.find((device) => device.id === item.deviceId) ?? null
+    })));
   } catch (error) {
     next(error);
   }
@@ -606,7 +686,10 @@ api.get('/incidents/:id', async (req, res, next) => {
 
 api.post('/incidents', async (req, res, next) => {
   try {
-    const created = await updateRuntimeData(async (currentData) => {
+    let createdIncident = null;
+
+    await updateRuntimeData(async (currentData) => {
+      const config = await getRuntimeConfig();
       const nextPayload = {
         estat: ESTATS_INCIDENCIA.PENDENT_OBRIR,
         ...req.body
@@ -615,11 +698,33 @@ api.post('/incidents', async (req, res, next) => {
       const errors = validateIncident(nextPayload, currentData);
       handleValidationResult(errors);
 
-      const payload = withTimestampsOnCreate({ ...nextPayload, id: uuidv4() });
-      return { ...currentData, incidents: [...currentData.incidents, payload] };
+      const deviceIndex = currentData.devices.findIndex((item) => item.id === nextPayload.deviceId);
+      if (deviceIndex === -1) {
+        const error = new Error('El dispositiu no existeix.');
+        error.status = 404;
+        throw error;
+      }
+
+      const nextDevices = [...currentData.devices];
+      const device = nextDevices[deviceIndex];
+
+      createdIncident = withTimestampsOnCreate({ ...nextPayload, id: uuidv4() });
+      nextDevices[deviceIndex] = withTimestampsOnUpdate(device, {
+        estat: ESTATS_DISPOSITIU.PENDENT_REPARACIO
+      });
+
+      if ([TIPUS_DISPOSITIU.ORDINADOR_ALUMNE, TIPUS_DISPOSITIU.ORDINADOR_DOCENT].includes(device.tipus)) {
+        await appendEstat(config.estatsXlsxPath, device.sace ?? '', ESTATS_DISPOSITIU.PENDENT_REPARACIO);
+      }
+
+      return {
+        ...currentData,
+        incidents: [...currentData.incidents, createdIncident],
+        devices: nextDevices
+      };
     });
 
-    res.status(201).json(created.incidents.at(-1));
+    res.status(201).json(createdIncident);
   } catch (error) {
     next(error);
   }
