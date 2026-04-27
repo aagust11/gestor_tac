@@ -1,5 +1,6 @@
 import { Link, Route, Routes } from 'react-router-dom';
 import { useEffect, useMemo, useState } from 'react';
+import { localApi } from './localApi';
 
 const API_BASE = 'http://localhost:3000/api';
 
@@ -8,21 +9,25 @@ const ESTATS_DISPOSITIU = ['Per entregar', 'Disponible', 'Entregat', 'Desaparegu
 const ESTATS_INCIDENCIA = ['Pendent obrir', 'Oberta', 'Resolta'];
 
 async function api(path, options = {}) {
-  const response = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options
-  });
+  try {
+    const response = await fetch(`${API_BASE}${path}`, {
+      headers: { 'Content-Type': 'application/json' },
+      ...options
+    });
 
-  if (!response.ok) {
-    const payload = await response.json().catch(() => ({ error: 'Error desconegut' }));
-    throw new Error(payload.error ?? 'Error a la crida API');
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({ error: 'Error desconegut' }));
+      throw new Error(payload.error ?? 'Error a la crida API');
+    }
+
+    if (response.status === 204) {
+      return null;
+    }
+
+    return response.json();
+  } catch {
+    return localApi(path, options);
   }
-
-  if (response.status === 204) {
-    return null;
-  }
-
-  return response.json();
 }
 
 function Box({ title, children }) {
@@ -43,7 +48,7 @@ function Layout({ children }) {
   return (
     <div style={{ fontFamily: 'Arial, sans-serif', margin: '1rem auto', maxWidth: 1240 }}>
       <h1>Gestor TAC local</h1>
-      <p style={{ marginTop: -6 }}>Aplicació en local amb persistència a fitxers del sistema.</p>
+      <p style={{ marginTop: -6 }}>Aplicació en català. Si no hi ha backend local, funciona en mode navegador (localStorage).</p>
       <nav style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 16 }}>
         <Link to="/">Dashboard</Link>
         <Link to="/dispositius">Dispositius</Link>
@@ -499,8 +504,12 @@ function Configuracio() {
   const testWrite = async () => {
     setError('');
     try {
-      await api('/config/test-write', { method: 'POST' });
-      setWriteResult('Prova d\'escriptura correcta als fitxers configurats.');
+      const result = await api('/config/test-write', { method: 'POST' });
+      if (result?.warning) {
+        setWriteResult(result.warning);
+      } else {
+        setWriteResult('Prova d\'escriptura correcta als fitxers configurats.');
+      }
     } catch (err) {
       setError(err.message);
       setWriteResult('');
