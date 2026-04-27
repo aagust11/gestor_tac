@@ -59,6 +59,10 @@ npm run -w frontend build
 2. Publica la carpeta `frontend/dist` a GitHub Pages.
 3. En obrir la web publicada, si no troba backend, canvia automàticament a mode localStorage.
 
+També tens GitHub Actions preparat:
+- `CI`: instal·la dependències i fa build del frontend.
+- `Deploy frontend to GitHub Pages`: publica `frontend/dist` automàticament quan fas push a `main`.
+
 ---
 
 ## Pantalles incloses (totes en català)
@@ -88,3 +92,7 @@ npm run -w frontend build
 
 GitHub Pages serveix una web estàtica; no executa Node.js ni permet accés directe al disc local.
 Per això, les operacions de `data.json`, `config.json` i `*.xlsx` només poden ser reals en mode backend local.
+
+Important:
+- El projecte **no crea cap fitxer Excel nou**.
+- Només escriu als fitxers `indic_assignacions.xlsx` i `indic_estats.xlsx` si aquestes rutes existeixen i són configurades a `config.json`.

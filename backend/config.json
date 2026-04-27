@@ -1,5 +1,5 @@
 {
   "dataPath": "./data.json",
-  "assignacionsXlsxPath": "./data/assignacions.xlsx",
-  "estatsXlsxPath": "./data/estats.xlsx"
+  "assignacionsXlsxPath": "./indic_assignacions.xlsx",
+  "estatsXlsxPath": "./indic_estats.xlsx"
 }
