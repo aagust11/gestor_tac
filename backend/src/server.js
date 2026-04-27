@@ -8,7 +8,12 @@ import {
   ESTATS_INCIDENCIA,
   TIPUS_DISPOSITIU
 } from './constants/domainConstants.js';
-import { loadAndValidateConfig, testWriteAccess } from './services/configService.js';
+import {
+  getConfigStatus,
+  loadAndValidateConfig,
+  saveConfig,
+  testWriteAccess
+} from './services/configService.js';
 import { appendAssignacio, appendEstat } from './services/xlsxService.js';
 import { ensureDataFile, readData, updateData } from './services/storage.js';
 import { validateAssignment } from './validators/assignmentValidator.js';
@@ -108,6 +113,22 @@ async function getRuntimeConfig() {
   return runtimeConfigPromise;
 }
 
+
+async function getDataPathFromConfig() {
+  const config = await getRuntimeConfig();
+  return config.dataPath;
+}
+
+async function readRuntimeData() {
+  const dataPath = await getDataPathFromConfig();
+  return readData(dataPath);
+}
+
+async function updateRuntimeData(updater) {
+  const dataPath = await getDataPathFromConfig();
+  return updateData(updater, dataPath);
+}
+
 async function appendAssignmentRowsToExcel(config, person, device) {
   await appendAssignacio(config.assignacionsXlsxPath, person.identificador ?? '', device.sace ?? '');
 
@@ -126,6 +147,27 @@ api.get('/health', (_req, res) => {
   res.json({ ok: true, servei: 'backend', basePath: '/api' });
 });
 
+
+api.get('/config', async (_req, res, next) => {
+  try {
+    const status = await getConfigStatus();
+    res.json({ ok: true, ...status });
+  } catch (error) {
+    next(error);
+  }
+});
+
+api.put('/config', async (req, res, next) => {
+  try {
+    const saved = await saveConfig(req.body ?? {});
+    runtimeConfigPromise = null;
+    const status = await getConfigStatus();
+    res.json({ ok: true, config: saved, files: status.files });
+  } catch (error) {
+    next(error);
+  }
+});
+
 api.post('/config/test-write', async (_req, res) => {
   try {
     const result = await testWriteAccess();
@@ -140,7 +182,7 @@ api.post('/config/test-write', async (_req, res) => {
 
 api.get('/devices', async (_req, res, next) => {
   try {
-    const data = await readData();
+    const data = await readRuntimeData();
     res.json(data.devices);
   } catch (error) {
     next(error);
@@ -149,7 +191,7 @@ api.get('/devices', async (_req, res, next) => {
 
 api.get('/devices/search', async (req, res, next) => {
   try {
-    const data = await readData();
+    const data = await readRuntimeData();
     const { q, sace, sn } = req.query;
     const queryText = typeof q === 'string' ? q : '';
 
@@ -166,7 +208,7 @@ api.get('/devices/search', async (req, res, next) => {
 
 api.get('/devices/:id', async (req, res, next) => {
   try {
-    const data = await readData();
+    const data = await readRuntimeData();
     const device = data.devices.find((item) => item.id === req.params.id);
 
     if (!device) {
@@ -181,7 +223,7 @@ api.get('/devices/:id', async (req, res, next) => {
 
 api.post('/devices', async (req, res, next) => {
   try {
-    const created = await updateData(async (currentData) => {
+    const created = await updateRuntimeData(async (currentData) => {
       const errors = validateDevice(req.body, currentData.devices);
       handleValidationResult(errors);
 
@@ -199,7 +241,7 @@ api.put('/devices/:id', async (req, res, next) => {
   try {
     let updatedDevice = null;
 
-    await updateData(async (currentData) => {
+    await updateRuntimeData(async (currentData) => {
       const index = currentData.devices.findIndex((item) => item.id === req.params.id);
       if (index === -1) {
         const error = new Error('Dispositiu no trobat/da.');
@@ -227,7 +269,7 @@ api.delete('/devices/:id', async (req, res, next) => {
   try {
     let found = false;
 
-    await updateData(async (currentData) => {
+    await updateRuntimeData(async (currentData) => {
       found = currentData.devices.some((item) => item.id === req.params.id);
       if (!found) {
         return currentData;
@@ -251,7 +293,7 @@ api.delete('/devices/:id', async (req, res, next) => {
 
 api.get('/people', async (_req, res, next) => {
   try {
-    const data = await readData();
+    const data = await readRuntimeData();
     res.json(data.people);
   } catch (error) {
     next(error);
@@ -260,7 +302,7 @@ api.get('/people', async (_req, res, next) => {
 
 api.get('/people/search', async (req, res, next) => {
   try {
-    const data = await readData();
+    const data = await readRuntimeData();
     const { q, nom, correu, identificador } = req.query;
     const queryText = typeof q === 'string' ? q : '';
 
@@ -278,7 +320,7 @@ api.get('/people/search', async (req, res, next) => {
 
 api.get('/people/:id', async (req, res, next) => {
   try {
-    const data = await readData();
+    const data = await readRuntimeData();
     const person = data.people.find((item) => item.id === req.params.id);
 
     if (!person) {
@@ -293,7 +335,7 @@ api.get('/people/:id', async (req, res, next) => {
 
 api.post('/people', async (req, res, next) => {
   try {
-    const created = await updateData(async (currentData) => {
+    const created = await updateRuntimeData(async (currentData) => {
       const errors = validatePerson(req.body, currentData.people);
       handleValidationResult(errors);
 
@@ -311,7 +353,7 @@ api.put('/people/:id', async (req, res, next) => {
   try {
     let updatedPerson = null;
 
-    await updateData(async (currentData) => {
+    await updateRuntimeData(async (currentData) => {
       const index = currentData.people.findIndex((item) => item.id === req.params.id);
       if (index === -1) {
         const error = new Error('Persona no trobat/da.');
@@ -339,7 +381,7 @@ api.delete('/people/:id', async (req, res, next) => {
   try {
     let found = false;
 
-    await updateData(async (currentData) => {
+    await updateRuntimeData(async (currentData) => {
       found = currentData.people.some((item) => item.id === req.params.id);
       if (!found) {
         return currentData;
@@ -363,7 +405,7 @@ api.delete('/people/:id', async (req, res, next) => {
 
 api.get('/assignments', async (_req, res, next) => {
   try {
-    const data = await readData();
+    const data = await readRuntimeData();
     res.json(data.assignments);
   } catch (error) {
     next(error);
@@ -372,7 +414,7 @@ api.get('/assignments', async (_req, res, next) => {
 
 api.get('/assignments/:id', async (req, res, next) => {
   try {
-    const data = await readData();
+    const data = await readRuntimeData();
     const assignment = data.assignments.find((item) => item.id === req.params.id);
 
     if (!assignment) {
@@ -389,7 +431,7 @@ api.post('/assignments', async (req, res, next) => {
   try {
     let summary = null;
 
-    await updateData(async (currentData) => {
+    await updateRuntimeData(async (currentData) => {
       const config = await getRuntimeConfig();
       const person = findPersonBySearch(currentData.people, req.body.personSearch ?? { id: req.body.personId });
       if (!person) {
@@ -483,7 +525,7 @@ api.put('/assignments/:id', async (req, res, next) => {
   try {
     let updatedAssignment = null;
 
-    await updateData(async (currentData) => {
+    await updateRuntimeData(async (currentData) => {
       const index = currentData.assignments.findIndex((item) => item.id === req.params.id);
       if (index === -1) {
         const error = new Error('Assignació no trobat/da.');
@@ -516,7 +558,7 @@ api.delete('/assignments/:id', async (req, res, next) => {
   try {
     let found = false;
 
-    await updateData(async (currentData) => {
+    await updateRuntimeData(async (currentData) => {
       found = currentData.assignments.some((item) => item.id === req.params.id);
       if (!found) {
         return currentData;
@@ -540,7 +582,7 @@ api.delete('/assignments/:id', async (req, res, next) => {
 
 api.get('/incidents', async (_req, res, next) => {
   try {
-    const data = await readData();
+    const data = await readRuntimeData();
     res.json(data.incidents);
   } catch (error) {
     next(error);
@@ -549,7 +591,7 @@ api.get('/incidents', async (_req, res, next) => {
 
 api.get('/incidents/:id', async (req, res, next) => {
   try {
-    const data = await readData();
+    const data = await readRuntimeData();
     const incident = data.incidents.find((item) => item.id === req.params.id);
 
     if (!incident) {
@@ -564,7 +606,7 @@ api.get('/incidents/:id', async (req, res, next) => {
 
 api.post('/incidents', async (req, res, next) => {
   try {
-    const created = await updateData(async (currentData) => {
+    const created = await updateRuntimeData(async (currentData) => {
       const nextPayload = {
         estat: ESTATS_INCIDENCIA.PENDENT_OBRIR,
         ...req.body
@@ -587,7 +629,7 @@ api.put('/incidents/:id', async (req, res, next) => {
   try {
     let updatedIncident = null;
 
-    await updateData(async (currentData) => {
+    await updateRuntimeData(async (currentData) => {
       const index = currentData.incidents.findIndex((item) => item.id === req.params.id);
       if (index === -1) {
         const error = new Error('Incidència no trobat/da.');
@@ -620,7 +662,7 @@ api.delete('/incidents/:id', async (req, res, next) => {
   try {
     let found = false;
 
-    await updateData(async (currentData) => {
+    await updateRuntimeData(async (currentData) => {
       found = currentData.incidents.some((item) => item.id === req.params.id);
       if (!found) {
         return currentData;
