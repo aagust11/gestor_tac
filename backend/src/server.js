@@ -10,7 +10,7 @@ import {
 } from './constants/domainConstants.js';
 import {
   getConfigStatus,
-  loadAndValidateConfig,
+  loadConfig,
   saveConfig,
   testWriteAccess
 } from './services/configService.js';
@@ -24,10 +24,38 @@ import { validatePerson } from './validators/personValidator.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const DEFAULT_ALLOWED_ORIGINS = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'https://*.github.io'
+];
+
+function isAllowedOrigin(origin) {
+  if (!origin) {
+    return true;
+  }
+
+  const configured = process.env.CORS_ALLOWED_ORIGINS
+    ? process.env.CORS_ALLOWED_ORIGINS.split(',').map((item) => item.trim()).filter(Boolean)
+    : DEFAULT_ALLOWED_ORIGINS;
+
+  return configured.some((rule) => {
+    if (rule.includes('*')) {
+      const regex = new RegExp(`^${rule.replace(/\./g, '\\.').replace(/\*/g, '.*')}$`);
+      return regex.test(origin);
+    }
+    return rule === origin;
+  });
+}
 
 app.use(
   cors({
-    origin: 'http://localhost:5173'
+    origin: (origin, callback) => {
+      if (isAllowedOrigin(origin)) {
+        return callback(null, true);
+      }
+      return callback(new Error(`Origen no permès per CORS: ${origin}`));
+    }
   })
 );
 app.use(express.json());
@@ -117,7 +145,7 @@ function mapAssignmentDetail(assignment, people, devices) {
 }
 
 async function getRuntimeConfig() {
-  runtimeConfigPromise ??= loadAndValidateConfig();
+  runtimeConfigPromise ??= loadConfig();
   return runtimeConfigPromise;
 }
 
@@ -807,7 +835,7 @@ app.use((error, _req, res, _next) => {
 
 async function bootstrap() {
   try {
-    const config = await loadAndValidateConfig();
+    const config = await loadConfig();
     await ensureDataFile(config.dataPath);
 
     app.listen(PORT, () => {
